@@ -1,66 +1,24 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-.env
-.venv
-env/
+dist/
+build/
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
+.env
+*.env
+
+# catbot runtime
+~/.catbot/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
-*.swo
-.DS_Store
 
-# Testing
-.tox/
-.coverage
-.coverage.*
-.cache
+# Test
 .pytest_cache/
-htmlcov/
-*.coveragerc
-
-# Type checking
 .mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Ruff
 .ruff_cache/
-
-# catbot runtime files
-sessions/
-HISTORY.md
-*.log
-
-# Secrets
-.env.local
-.env.*.local
-secrets.toml
+htmlcov/
+.coverage

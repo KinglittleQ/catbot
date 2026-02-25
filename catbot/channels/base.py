@@ -1,98 +1,95 @@
 """
-Abstract base classes for channels.
+Channel base classes.
+
+A Channel is a message source/sink (Feishu, CLI, Telegram, etc.).
+The Gateway connects channels to the Agent.
+
+Inspired by openclaw's channel architecture:
+- Each channel has a unique name
+- Channels emit IncomingMessage events
+- Channels receive OutgoingMessage to send
+- Group messages carry group_id; only respond when @mentioned
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Awaitable
-
-
-class MessageType(str, Enum):
-    TEXT = "text"
-    IMAGE = "image"
-    FILE = "file"
-    AUDIO = "audio"
-    UNKNOWN = "unknown"
+from typing import Any, Awaitable, Callable
 
 
 @dataclass
 class IncomingMessage:
     """A message received from a channel."""
 
-    channel: str                      # Channel name, e.g. "feishu", "cli"
-    chat_id: str                      # Chat/group ID
-    user_id: str                      # Sender user ID
-    message_id: str                   # Platform message ID
-    text: str                         # Plain text content
-    message_type: MessageType = MessageType.TEXT
-    raw: Any = None                   # Raw platform event object
-    attachments: list[dict[str, Any]] = field(default_factory=list)
-    is_mention: bool = False          # Was the bot @mentioned?
-    metadata: dict[str, Any] = field(default_factory=dict)
+    channel: str        # Channel name, e.g. "feishu", "cli"
+    sender_id: str      # User/sender identifier
+    chat_id: str        # Chat/conversation identifier
+    content: str        # Text content
 
-    @property
-    def session_key(self) -> str:
-        """Composite session key: 'channel:chat_id'."""
-        return f"{self.channel}:{self.chat_id}"
+    # Group chat
+    is_group: bool = False
+    group_id: str = ""
+
+    # Thread/topic (openclaw: thread session keys)
+    thread_id: str = ""
+
+    # Reply context
+    reply_to_id: str = ""
+
+    # Raw metadata from the channel SDK
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class OutgoingMessage:
-    """A message to be sent via a channel."""
+    """A message to send through a channel."""
 
+    channel: str
     chat_id: str
-    text: str | None = None
-    image_path: str | None = None
-    file_path: str | None = None
-    reply_to_message_id: str | None = None
-    message_type: MessageType = MessageType.TEXT
+    content: str
+
+    # Optional: reply in thread
+    thread_id: str = ""
+    reply_to_id: str = ""
+
+    # Attachments
+    image_path: str = ""
+    file_path: str = ""
+
+    # Metadata (channel-specific extras)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-# Handler type: async function that receives an IncomingMessage and returns a reply string
-MessageHandler = Callable[[IncomingMessage], Awaitable[str | None]]
+# Callback type: called when a message arrives
+MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 
 
-class Channel(ABC):
-    """Abstract base class for message channels."""
+class BaseChannel(ABC):
+    """Abstract base class for all channels."""
 
     name: str = "base"
 
-    def __init__(self) -> None:
-        self._handler: MessageHandler | None = None
-
-    def set_handler(self, handler: MessageHandler) -> None:
-        """Register the message handler callback."""
-        self._handler = handler
-
-    async def _dispatch(self, msg: IncomingMessage) -> str | None:
-        """Dispatch an incoming message to the registered handler."""
-        if self._handler is None:
-            return None
-        return await self._handler(msg)
-
     @abstractmethod
-    async def send(self, message: OutgoingMessage) -> None:
-        """Send a message through this channel."""
-        ...
-
-    @abstractmethod
-    async def start(self) -> None:
-        """Start the channel (connect, listen, etc.)."""
+    async def start(self, on_message: MessageHandler) -> None:
+        """Start listening for messages. Calls on_message for each."""
         ...
 
     @abstractmethod
     async def stop(self) -> None:
-        """Stop the channel gracefully."""
+        """Stop the channel."""
         ...
 
-    async def add_reaction(self, message_id: str, emoji: str) -> None:
-        """Add an emoji reaction to a message (optional, no-op by default)."""
-        pass
+    @abstractmethod
+    async def send(self, msg: OutgoingMessage) -> bool:
+        """Send a message. Returns True on success."""
+        ...
 
-    async def remove_reaction(self, message_id: str, emoji: str) -> None:
-        """Remove an emoji reaction from a message (optional, no-op by default)."""
-        pass
+    async def send_text(self, chat_id: str, text: str, **kwargs: Any) -> bool:
+        """Convenience: send a plain text message."""
+        return await self.send(OutgoingMessage(
+            channel=self.name,
+            chat_id=chat_id,
+            content=text,
+            **kwargs,
+        ))

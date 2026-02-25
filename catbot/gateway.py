@@ -1,224 +1,354 @@
 """
-Gateway: connects channels to the agent.
+Gateway — connects channels to the agent.
 
-Manages multiple channels, routes messages to the agent,
-manages sessions, and supports middleware.
+Inspired by openclaw's gateway architecture:
+- Routes IncomingMessage → Agent.run() → OutgoingMessage
+- Manages session keys (openclaw format: agent:<id>:<channel>:<type>:<chat_id>)
+- Middleware chain (rate limiting, allowlists, logging)
+- Concurrent message handling per chat (queue per chat_id)
+- Send policy: allow/deny per session type (openclaw: send-policy.ts)
+
+Session key format (mirrors openclaw/src/sessions/session-key-utils.ts):
+    agent:<agentId>:<channel>:direct:<senderId>    — DM
+    agent:<agentId>:<channel>:group:<groupId>      — Group chat
+    agent:<agentId>:cli:direct:local               — CLI
+    agent:<agentId>:cron:cron:<jobId>              — Cron job
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Awaitable
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
 from catbot.agent import Agent
-from catbot.channels.base import Channel, IncomingMessage, OutgoingMessage
-from catbot.session import SessionManager
+from catbot.channels.base import BaseChannel, IncomingMessage, OutgoingMessage
+from catbot.session import SessionManager, make_session_key
+from catbot.memory import Memory
 
 
-# Middleware type: async function (msg, next) → str | None
-MiddlewareFn = Callable[
-    [IncomingMessage, Callable[[IncomingMessage], Awaitable[str | None]]],
-    Awaitable[str | None],
-]
+# ---------------------------------------------------------------------------
+# Middleware
+# ---------------------------------------------------------------------------
 
+Middleware = Callable[[IncomingMessage, Callable], Awaitable[str | None]]
+"""A middleware is an async function:
+    async def my_middleware(msg, next) -> str | None:
+        # return None to block, or call next(msg) to continue
+        if not allowed(msg.sender_id):
+            return None
+        return await next(msg)
+"""
+
+
+# ---------------------------------------------------------------------------
+# Gateway config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GatewayConfig:
+    """Gateway configuration."""
+
+    agent_id: str = "main"
+
+    # Session
+    daily_reset: bool = False           # Reset sessions each day
+    session_dir: str = "~/.catbot/sessions"
+
+    # Send policy (openclaw: resolveSendPolicy)
+    # "allow" | "deny" | per-channel overrides
+    send_policy: str = "allow"
+    deny_channels: list[str] = field(default_factory=list)
+    allow_senders: list[str] = field(default_factory=list)  # Empty = allow all
+
+    # Concurrency: max parallel agent runs per chat_id
+    max_concurrent_per_chat: int = 1
+
+
+# ---------------------------------------------------------------------------
+# Gateway
+# ---------------------------------------------------------------------------
 
 class Gateway:
-    """
-    Routes messages from one or more channels to an Agent.
+    """Connects channels to the agent with session management and middleware.
 
-    Responsibilities:
-    - Register channels
-    - Manage sessions (via SessionManager)
-    - Apply middleware chain
-    - Call agent.run() and send reply back via channel
+    Usage::
+
+        gw = Gateway(agent=agent)
+        gw.add_channel(FeishuChannel(app_id=..., app_secret=...))
+        gw.use(rate_limit_middleware)
+        await gw.run()
     """
 
     def __init__(
         self,
         agent: Agent,
-        session_manager: SessionManager | None = None,
-        daily_reset: bool = False,
+        config: GatewayConfig | None = None,
+        memory: Memory | None = None,
     ) -> None:
         self.agent = agent
-        self.sessions = session_manager or SessionManager()
-        self.daily_reset = daily_reset
-        self._channels: dict[str, Channel] = {}
-        self._middlewares: list[MiddlewareFn] = []
+        self.config = config or GatewayConfig()
+        self.memory = memory
+
+        self._channels: dict[str, BaseChannel] = {}
+        self._middleware: list[Middleware] = []
+        self._sessions = SessionManager(self.config.session_dir)
+
+        # Per-chat semaphores to serialize messages from the same chat
+        self._chat_locks: dict[str, asyncio.Semaphore] = {}
 
     # ------------------------------------------------------------------
-    # Channel management
+    # Setup
     # ------------------------------------------------------------------
 
-    def add_channel(self, channel: Channel) -> None:
-        """Register a channel with this gateway."""
-        channel.set_handler(self._make_handler(channel))
+    def add_channel(self, channel: BaseChannel) -> "Gateway":
+        """Register a channel. Returns self for chaining."""
         self._channels[channel.name] = channel
-        logger.info(f"Gateway: registered channel '{channel.name}'")
+        logger.info(f"[gateway] Channel registered: {channel.name!r}")
+        return self
 
-    def get_channel(self, name: str) -> Channel | None:
-        """Look up a channel by name."""
-        return self._channels.get(name)
-
-    # ------------------------------------------------------------------
-    # Middleware
-    # ------------------------------------------------------------------
-
-    def use(self, middleware: MiddlewareFn) -> None:
-        """
-        Add a middleware function.
-
-        Middleware signature::
-
-            async def my_middleware(
-                msg: IncomingMessage,
-                next: Callable[[IncomingMessage], Awaitable[str | None]],
-            ) -> str | None:
-                # pre-processing
-                result = await next(msg)
-                # post-processing
-                return result
-        """
-        self._middlewares.append(middleware)
-        logger.debug(f"Gateway: added middleware {middleware.__name__}")
-
-    def _make_handler(self, channel: Channel) -> Callable[[IncomingMessage], Awaitable[str | None]]:
-        """Create the message handler for a specific channel."""
-        async def handler(msg: IncomingMessage) -> str | None:
-            return await self._process(msg, channel)
-        return handler
-
-    async def _process(self, msg: IncomingMessage, channel: Channel) -> str | None:
-        """Run the middleware chain and then the agent."""
-        # Build the innermost handler
-        async def core(m: IncomingMessage) -> str | None:
-            return await self._run_agent(m, channel)
-
-        # Wrap with middlewares (last registered = innermost)
-        handler = core
-        for mw in reversed(self._middlewares):
-            prev = handler
-            async def wrapped(m: IncomingMessage, _mw=mw, _prev=prev) -> str | None:
-                return await _mw(m, _prev)
-            handler = wrapped
-
-        try:
-            return await handler(msg)
-        except Exception as exc:
-            logger.error(f"Gateway processing error: {exc}")
-            return f"⚠️ Internal error: {exc}"
-
-    async def _run_agent(self, msg: IncomingMessage, channel: Channel) -> str | None:
-        """Fetch/create session and run the agent."""
-        session = await self.sessions.get(
-            msg.session_key, daily_reset=self.daily_reset
-        )
-        logger.info(
-            f"Gateway: [{msg.channel}] user={msg.user_id} chat={msg.chat_id} "
-            f"text={msg.text[:80]!r}"
-        )
-        try:
-            reply = await self.agent.run(
-                user_message=msg.text,
-                session=session,
-            )
-        except Exception as exc:
-            logger.error(f"Agent.run() error: {exc}")
-            reply = f"⚠️ Agent error: {exc}"
-
-        return reply
+    def use(self, middleware: Middleware) -> "Gateway":
+        """Add a middleware to the chain. Returns self for chaining."""
+        self._middleware.append(middleware)
+        return self
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Run
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
-        """Start all registered channels concurrently."""
+    async def run(self) -> None:
+        """Start all channels and block until stopped."""
         if not self._channels:
-            logger.warning("Gateway.start(): no channels registered")
-            return
+            raise RuntimeError("No channels registered. Call add_channel() first.")
 
-        logger.info(f"Gateway: starting {len(self._channels)} channel(s)...")
-        tasks = [asyncio.create_task(ch.start()) for ch in self._channels.values()]
+        tasks = [
+            asyncio.create_task(
+                channel.start(self._on_message),
+                name=f"channel:{name}",
+            )
+            for name, channel in self._channels.items()
+        ]
+        logger.info(f"[gateway] Started {len(tasks)} channel(s): {list(self._channels.keys())}")
+
         try:
             await asyncio.gather(*tasks)
         except Exception as exc:
-            logger.error(f"Gateway error: {exc}")
+            logger.error(f"[gateway] Fatal error: {exc}")
             raise
+        finally:
+            await self.stop()
 
     async def stop(self) -> None:
-        """Stop all registered channels."""
-        for ch in self._channels.values():
+        """Stop all channels."""
+        for channel in self._channels.values():
             try:
-                await ch.stop()
+                await channel.stop()
             except Exception as exc:
-                logger.warning(f"Error stopping channel '{ch.name}': {exc}")
-        logger.info("Gateway stopped")
-
-    async def send(self, channel_name: str, message: OutgoingMessage) -> None:
-        """Send a message directly via a named channel."""
-        channel = self._channels.get(channel_name)
-        if channel is None:
-            raise ValueError(f"Unknown channel: {channel_name!r}")
-        await channel.send(message)
+                logger.warning(f"[gateway] Error stopping channel {channel.name!r}: {exc}")
 
     # ------------------------------------------------------------------
-    # Convenience: built-in rate-limit middleware
+    # Message routing
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def rate_limit(
-        max_calls: int = 10,
-        window_seconds: float = 60.0,
-    ) -> MiddlewareFn:
+    async def _on_message(self, msg: IncomingMessage) -> None:
+        """Called by channels when a message arrives."""
+        # Apply send policy
+        if not self._check_send_policy(msg):
+            logger.debug(f"[gateway] Message blocked by send policy: {msg.sender_id!r}")
+            return
+
+        # Run middleware chain
+        async def execute_chain(m: IncomingMessage) -> str | None:
+            return await self._run_agent(m)
+
+        handler = execute_chain
+        for mw in reversed(self._middleware):
+            prev = handler
+            async def make_handler(middleware: Middleware, next_handler: Callable) -> Callable:
+                async def h(m: IncomingMessage) -> str | None:
+                    return await middleware(m, next_handler)
+                return h
+            handler = await make_handler(mw, prev)
+
+        # Serialize per chat_id
+        lock = self._get_chat_lock(msg.chat_id)
+        async with lock:
+            try:
+                reply = await handler(msg)
+                if reply:
+                    await self._send_reply(msg, reply)
+            except Exception as exc:
+                logger.error(f"[gateway] Error processing message: {exc}")
+
+    async def _run_agent(self, msg: IncomingMessage) -> str | None:
+        """Run the agent for an incoming message."""
+        session_key = self._make_session_key(msg)
+        session = await self._sessions.get(
+            session_key,
+            daily_reset=self.config.daily_reset,
+        )
+
+        logger.info(
+            f"[gateway] {msg.channel}:{msg.chat_id} "
+            f"({session_key}) — {msg.content[:80]!r}"
+        )
+
+        try:
+            reply = await self.agent.run(
+                user_message=msg.content,
+                session=session,
+                sender_id=msg.sender_id,
+            )
+            return reply
+        except Exception as exc:
+            logger.error(f"[gateway] Agent error: {exc}")
+            return f"Error: {exc}"
+
+    async def _send_reply(self, original: IncomingMessage, reply: str) -> None:
+        """Send a reply through the originating channel."""
+        channel = self._channels.get(original.channel)
+        if not channel:
+            logger.warning(f"[gateway] Channel {original.channel!r} not found for reply")
+            return
+
+        out = OutgoingMessage(
+            channel=original.channel,
+            chat_id=original.chat_id,
+            content=reply,
+            thread_id=original.thread_id,
+            reply_to_id=original.reply_to_id,
+        )
+        await channel.send(out)
+
+    # ------------------------------------------------------------------
+    # Session key (openclaw-style)
+    # ------------------------------------------------------------------
+
+    def _make_session_key(self, msg: IncomingMessage) -> str:
+        """Build a canonical session key for a message.
+
+        Mirrors openclaw's session key format:
+            agent:<agentId>:<channel>:<type>:<id>
         """
-        Simple per-user rate limiting middleware.
+        chat_type = "group" if msg.is_group else "direct"
+        chat_id = msg.group_id if msg.is_group else msg.sender_id
+        return make_session_key(
+            agent_id=self.config.agent_id,
+            channel=msg.channel,
+            chat_type=chat_type,  # type: ignore[arg-type]
+            chat_id=chat_id or msg.chat_id,
+        )
 
-        Args:
-            max_calls: Maximum number of calls per user per window.
-            window_seconds: Time window in seconds.
+    # ------------------------------------------------------------------
+    # Send policy (openclaw: resolveSendPolicy)
+    # ------------------------------------------------------------------
+
+    def _check_send_policy(self, msg: IncomingMessage) -> bool:
+        """Check if a message should be processed."""
+        # Global deny
+        if self.config.send_policy == "deny":
+            return False
+
+        # Channel-level deny
+        if msg.channel in self.config.deny_channels:
+            return False
+
+        # Allowlist check
+        if self.config.allow_senders and msg.sender_id not in self.config.allow_senders:
+            logger.debug(f"[gateway] Sender {msg.sender_id!r} not in allow_senders")
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_chat_lock(self, chat_id: str) -> asyncio.Semaphore:
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Semaphore(
+                self.config.max_concurrent_per_chat
+            )
+        return self._chat_locks[chat_id]
+
+    # ------------------------------------------------------------------
+    # Direct processing (for cron / CLI usage)
+    # ------------------------------------------------------------------
+
+    async def process(
+        self,
+        content: str,
+        channel: str = "cli",
+        chat_id: str = "local",
+        sender_id: str = "system",
+        is_group: bool = False,
+        session_key: str | None = None,
+    ) -> str:
+        """Process a message directly without going through channel routing.
+
+        Useful for cron jobs, CLI, and testing.
         """
-        import time
-        call_log: dict[str, list[float]] = {}
+        msg = IncomingMessage(
+            channel=channel,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            is_group=is_group,
+        )
 
-        async def middleware(
-            msg: IncomingMessage,
-            next_fn: Callable[[IncomingMessage], Awaitable[str | None]],
-        ) -> str | None:
-            user_key = f"{msg.channel}:{msg.user_id}"
-            now = time.monotonic()
-            timestamps = call_log.get(user_key, [])
-            # Remove old entries outside window
-            timestamps = [t for t in timestamps if now - t < window_seconds]
-            if len(timestamps) >= max_calls:
-                logger.warning(f"Rate limit hit for {user_key}")
-                return f"⚠️ Rate limit: max {max_calls} messages per {window_seconds:.0f}s."
-            timestamps.append(now)
-            call_log[user_key] = timestamps
-            return await next_fn(msg)
+        key = session_key or self._make_session_key(msg)
+        session = await self._sessions.get(key, daily_reset=self.config.daily_reset)
 
-        middleware.__name__ = "rate_limit"
-        return middleware
+        return await self.agent.run(
+            user_message=content,
+            session=session,
+            sender_id=sender_id,
+        )
 
-    @staticmethod
-    def allow_users(allowed_user_ids: list[str]) -> MiddlewareFn:
-        """
-        Middleware that restricts access to a whitelist of user IDs.
 
-        Args:
-            allowed_user_ids: List of permitted user IDs.
-        """
-        allowed = set(allowed_user_ids)
+# ---------------------------------------------------------------------------
+# Built-in middleware factories
+# ---------------------------------------------------------------------------
 
-        async def middleware(
-            msg: IncomingMessage,
-            next_fn: Callable[[IncomingMessage], Awaitable[str | None]],
-        ) -> str | None:
-            if msg.user_id not in allowed:
-                logger.warning(f"Unauthorized user: {msg.user_id}")
-                return "⛔ Access denied."
-            return await next_fn(msg)
+def rate_limit(max_per_minute: int = 10) -> Middleware:
+    """Rate-limit middleware: max N messages per sender per minute."""
+    import time
+    counts: dict[str, list[float]] = {}
 
-        middleware.__name__ = "allow_users"
-        return middleware
+    async def middleware(msg: IncomingMessage, next: Callable) -> str | None:
+        now = time.time()
+        window = counts.setdefault(msg.sender_id, [])
+        # Remove entries older than 60s
+        counts[msg.sender_id] = [t for t in window if now - t < 60]
+        if len(counts[msg.sender_id]) >= max_per_minute:
+            logger.warning(f"[rate_limit] {msg.sender_id!r} exceeded {max_per_minute}/min")
+            return "Rate limit exceeded. Please wait a moment."
+        counts[msg.sender_id].append(now)
+        return await next(msg)
+
+    return middleware
+
+
+def allow_senders(sender_ids: list[str]) -> Middleware:
+    """Allowlist middleware: only process messages from listed senders."""
+    allowed = set(sender_ids)
+
+    async def middleware(msg: IncomingMessage, next: Callable) -> str | None:
+        if msg.sender_id not in allowed:
+            logger.debug(f"[allow_senders] Blocked: {msg.sender_id!r}")
+            return None
+        return await next(msg)
+
+    return middleware
+
+
+def log_messages() -> Middleware:
+    """Logging middleware: log every incoming message."""
+    async def middleware(msg: IncomingMessage, next: Callable) -> str | None:
+        logger.info(f"[log] {msg.channel}/{msg.chat_id} [{msg.sender_id}]: {msg.content[:100]!r}")
+        result = await next(msg)
+        logger.info(f"[log] reply: {(result or '')[:100]!r}")
+        return result
+    return middleware

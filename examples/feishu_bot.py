@@ -1,85 +1,78 @@
 """
-Feishu bot example.
+Feishu Bot — production-ready Feishu bot using catbot.
 
 Setup:
     1. Create a Feishu app at https://open.feishu.cn/
     2. Enable "Bot" capability
     3. Subscribe to "Receive messages" event (im.message.receive_v1)
-    4. Enable WebSocket long connection
-    5. Set env vars and run:
+    4. Set env vars:
+         FEISHU_APP_ID=cli_xxx
+         FEISHU_APP_SECRET=xxx
+         ANTHROPIC_API_KEY=sk-ant-xxx  (or OPENAI_API_KEY)
 
-    export FEISHU_APP_ID=cli_xxxx
-    export FEISHU_APP_SECRET=xxxx
-    export ANTHROPIC_API_KEY=sk-ant-xxxx
+Run:
     python examples/feishu_bot.py
 """
 
 import asyncio
 import os
 
-from loguru import logger
+from catbot import Gateway, GatewayConfig, AnthropicProvider
+from catbot.tools import tool, get_builtin_tools
 
-from catbot import (
-    Agent,
-    AgentConfig,
-    AnthropicProvider,
-    FeishuChannel,
-    Gateway,
-    Memory,
-    SessionManager,
-)
-from catbot.tools import default_registry
 
+# ---------------------------------------------------------------------------
+# Custom tools
+# ---------------------------------------------------------------------------
+
+@tool()
+async def get_weather(city: str) -> str:
+    """Get current weather for a city.
+
+    city: City name, e.g. "Beijing" or "海口"
+    """
+    # Replace with a real weather API call
+    return f"Weather in {city}: 25°C, sunny ☀️"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # --- Provider ---
+    # Provider (Anthropic with prompt caching)
     provider = AnthropicProvider(
-        api_key=os.environ.get("ANTHROPIC_API_KEY"),
-        model="claude-3-5-sonnet-20241022",
-        enable_caching=True,
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        model="claude-haiku-4-5",
+        enable_cache=True,
     )
 
-    # --- Memory ---
-    memory = Memory(memory_file="MEMORY.md", history_file="HISTORY.md")
-
-    # --- Tools ---
-    tools = default_registry()
-
-    # --- Agent ---
-    agent = Agent(
-        provider=provider,
-        tools=tools,
-        memory=memory,
-        config=AgentConfig(
-            system_prompt=(
-                "You are a helpful Feishu bot assistant. "
-                "You can read/write files and execute shell commands when needed. "
-                "Be concise and friendly."
-            ),
-            max_turns=8,
-            max_tokens=2048,
+    # Gateway config
+    config = GatewayConfig(
+        agent_id="main",
+        feishu_app_id=os.environ["FEISHU_APP_ID"],
+        feishu_app_secret=os.environ["FEISHU_APP_SECRET"],
+        feishu_bot_name=os.getenv("FEISHU_BOT_NAME", ""),
+        feishu_group_mention_only=True,   # In groups, only respond when @mentioned
+        system_prompt=(
+            "You are a helpful AI assistant. "
+            "Be concise and friendly. Reply in the user's language."
         ),
+        workspace_dir="~/.catbot/workspace",
+        compaction_enabled=True,
+        context_window=200_000,
+        daily_reset=False,
     )
 
-    # --- Session manager ---
-    sessions = SessionManager(base_dir="./sessions")
+    # Build gateway
+    gw = Gateway(provider=provider, config=config)
 
-    # --- Gateway with middleware ---
-    gateway = Gateway(agent=agent, session_manager=sessions, daily_reset=True)
+    # Register tools
+    gw.add_builtin_tools()
+    gw.add_tool(get_weather)
 
-    # Rate limit: 20 messages per user per minute
-    gateway.use(Gateway.rate_limit(max_calls=20, window_seconds=60))
-
-    # --- Feishu channel ---
-    feishu = FeishuChannel(
-        app_id=os.environ.get("FEISHU_APP_ID"),
-        app_secret=os.environ.get("FEISHU_APP_SECRET"),
-        respond_in_group_only_when_mentioned=True,
-    )
-    gateway.add_channel(feishu)
-
-    logger.info("Feishu bot starting...")
-    await gateway.start()
+    # Start (blocks until interrupted)
+    await gw.start()
 
 
 if __name__ == "__main__":

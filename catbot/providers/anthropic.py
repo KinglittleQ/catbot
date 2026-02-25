@@ -1,138 +1,99 @@
 """
-Anthropic native LLM provider.
+Anthropic provider with prompt caching support.
 
-Supports Claude models via the official anthropic SDK.
-Features prompt caching via cache_control.
+Implements openclaw-style cache_control breakpoints:
+- BP1: system prompt (always cached)
+- BP2: before last user message (cached after N messages)
+- BP3: second-to-last message
+
+Usage::
+
+    provider = AnthropicProvider(api_key="sk-ant-...", model="claude-opus-4-5")
+    # With prompt caching
+    provider = AnthropicProvider(
+        api_key="sk-ant-...",
+        model="claude-opus-4-5",
+        enable_cache=True,
+    )
 """
 
 from __future__ import annotations
 
-import uuid
+import json
 from typing import Any
 
 from loguru import logger
 
-from catbot.providers.base import LLMProvider, Message, ToolCall, LLMResponse
+from .base import LLMProvider, LLMResponse, ToolCall
 
 
 class AnthropicProvider(LLMProvider):
-    """
-    LLM provider for Anthropic Claude models.
-
-    Args:
-        api_key: Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
-        model: Default model name.
-        enable_caching: Enable prompt caching (cache_control) for system prompt.
-    """
+    """Anthropic provider with native SDK and optional prompt caching."""
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = "claude-3-5-sonnet-20241022",
-        enable_caching: bool = True,
+        api_key: str,
+        model: str = "claude-opus-4-5",
+        api_base: str | None = None,
+        enable_cache: bool = False,
+        max_cache_breakpoints: int = 3,
     ) -> None:
-        import os
         try:
-            import anthropic as _anthropic
-            self._anthropic = _anthropic
-        except ImportError as exc:
-            raise ImportError("anthropic package is required: pip install anthropic") from exc
+            import anthropic
+            self._anthropic = anthropic
+        except ImportError:
+            raise ImportError("pip install anthropic")
 
         self._model = model
-        self._enable_caching = enable_caching
-        self._client = _anthropic.AsyncAnthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""),
+        self._enable_cache = enable_cache
+        self._max_cache_breakpoints = max_cache_breakpoints
+        self._client = anthropic.AsyncAnthropic(
+            api_key=api_key,
+            base_url=api_base,
         )
-        logger.debug(f"AnthropicProvider initialized: model={model}, caching={enable_caching}")
 
-    @property
     def default_model(self) -> str:
         return self._model
 
     async def complete(
         self,
-        messages: list[Message],
-        system: str = "",
+        messages: list[dict[str, Any]],
+        system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
-        """Call the Anthropic Messages API."""
-        use_model = model or self._model
+        # Convert messages to Anthropic format
+        anthropic_messages = self._convert_messages(messages)
 
-        # Build system prompt with optional cache_control
-        system_param: Any
+        # Apply cache breakpoints (openclaw-style: last 2 user messages)
+        if self._enable_cache:
+            self._apply_cache_breakpoints(anthropic_messages)
+
+        # Build system parameter
+        system_param: Any = None
         if system:
-            if self._enable_caching:
-                system_param = [
-                    {
-                        "type": "text",
-                        "text": system,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
+            if self._enable_cache:
+                system_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
             else:
                 system_param = system
-        else:
-            system_param = None
 
-        # Convert messages to Anthropic format
-        ant_messages: list[dict[str, Any]] = []
-        for msg in messages:
-            if msg.role == "tool":
-                # Tool results
-                tool_result_blocks: list[dict[str, Any]] = []
-                for result in msg.tool_results:
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result["call_id"],
-                        "content": result["result"],
-                    })
-                ant_messages.append({"role": "user", "content": tool_result_blocks})
-
-            elif msg.role == "assistant":
-                content_blocks: list[Any] = []
-                if msg.content:
-                    content_blocks.append({"type": "text", "text": msg.content})
-                for tc in msg.tool_calls:
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.call_id,
-                        "name": tc.name,
-                        "input": tc.arguments,
-                    })
-                ant_messages.append({"role": "assistant", "content": content_blocks})
-
-            else:
-                # user message
-                ant_messages.append({
-                    "role": msg.role,
-                    "content": msg.content or "",
-                })
-
-        # Build tool definitions
-        ant_tools: list[dict[str, Any]] | None = None
+        # Convert tools to Anthropic format
+        anthropic_tools = None
         if tools:
-            ant_tools = [
-                {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "input_schema": t.get("parameters", {"type": "object", "properties": {}}),
-                }
-                for t in tools
-            ]
+            anthropic_tools = [self._convert_tool(t) for t in tools]
 
         kwargs: dict[str, Any] = {
-            "model": use_model,
+            "model": model or self._model,
+            "messages": anthropic_messages,
             "max_tokens": max_tokens,
-            "messages": ant_messages,
             "temperature": temperature,
         }
         if system_param is not None:
             kwargs["system"] = system_param
-        if ant_tools:
-            kwargs["tools"] = ant_tools
+        if anthropic_tools:
+            kwargs["tools"] = anthropic_tools
 
         try:
             resp = await self._client.messages.create(**kwargs)
@@ -141,45 +102,101 @@ class AnthropicProvider(LLMProvider):
             raise
 
         # Parse response content blocks
-        text_parts: list[str] = []
-        parsed_tool_calls: list[ToolCall] = []
+        content_text: list[str] = []
+        tool_calls: list[ToolCall] = []
 
         for block in resp.content:
             if block.type == "text":
-                text_parts.append(block.text)
+                content_text.append(block.text)
             elif block.type == "tool_use":
-                parsed_tool_calls.append(
-                    ToolCall(
-                        call_id=block.id or str(uuid.uuid4()),
-                        name=block.name,
-                        arguments=block.input if isinstance(block.input, dict) else {},
-                    )
-                )
+                tool_calls.append(ToolCall(
+                    call_id=block.id,
+                    name=block.name,
+                    arguments=block.input or {},
+                ))
 
-        content = "\n".join(text_parts) if text_parts else None
-        finish_reason = "tool_calls" if parsed_tool_calls else str(resp.stop_reason or "stop")
-
+        # Usage stats
         usage: dict[str, int] = {}
         if resp.usage:
             usage = {
-                "input_tokens": resp.usage.input_tokens or 0,
-                "output_tokens": resp.usage.output_tokens or 0,
+                "input": resp.usage.input_tokens,
+                "output": resp.usage.output_tokens,
             }
-            # Cache stats if available
-            if hasattr(resp.usage, "cache_read_input_tokens"):
-                usage["cache_read_tokens"] = resp.usage.cache_read_input_tokens or 0
-            if hasattr(resp.usage, "cache_creation_input_tokens"):
-                usage["cache_write_tokens"] = resp.usage.cache_creation_input_tokens or 0
-
-        logger.debug(
-            f"Anthropic response: model={resp.model}, stop={resp.stop_reason}, "
-            f"tool_calls={len(parsed_tool_calls)}, usage={usage}"
-        )
+            if hasattr(resp.usage, "cache_read_input_tokens") and resp.usage.cache_read_input_tokens:
+                usage["cache_read"] = resp.usage.cache_read_input_tokens
+            if hasattr(resp.usage, "cache_creation_input_tokens") and resp.usage.cache_creation_input_tokens:
+                usage["cache_write"] = resp.usage.cache_creation_input_tokens
 
         return LLMResponse(
-            content=content,
-            tool_calls=parsed_tool_calls,
-            finish_reason=finish_reason,
+            content="\n".join(content_text) or None,
+            tool_calls=tool_calls,
+            finish_reason=resp.stop_reason or "stop",
             usage=usage,
-            model=resp.model or use_model,
         )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert catbot message format to Anthropic format."""
+        result: list[dict[str, Any]] = []
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                # System messages are passed separately; skip here
+                continue
+            elif role == "user":
+                result.append({"role": "user", "content": msg.get("content", "")})
+            elif role == "assistant":
+                content: list[dict[str, Any]] = []
+                if msg.get("content"):
+                    content.append({"type": "text", "text": msg["content"]})
+                for tc in msg.get("tool_calls", []):
+                    content.append({
+                        "type": "tool_use",
+                        "id": tc["call_id"],
+                        "name": tc["name"],
+                        "input": tc.get("arguments", {}),
+                    })
+                result.append({"role": "assistant", "content": content or ""})
+            elif role == "tool":
+                # Tool results → user message with tool_result blocks
+                tool_results = msg.get("tool_results", [])
+                if tool_results:
+                    content = [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tr["call_id"],
+                            "content": tr.get("content", ""),
+                        }
+                        for tr in tool_results
+                    ]
+                    result.append({"role": "user", "content": content})
+
+        return result
+
+    def _apply_cache_breakpoints(self, messages: list[dict[str, Any]]) -> None:
+        """Apply cache_control to the last N user messages (openclaw-style)."""
+        user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        # Mark last max_cache_breakpoints user messages
+        for idx in user_indices[-self._max_cache_breakpoints:]:
+            msg = messages[idx]
+            content = msg.get("content")
+            if isinstance(content, str):
+                messages[idx]["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+            elif isinstance(content, list) and content:
+                # Add cache_control to last block
+                content[-1]["cache_control"] = {"type": "ephemeral"}
+
+    def _convert_tool(self, tool_schema: dict[str, Any]) -> dict[str, Any]:
+        """Convert OpenAI tool schema to Anthropic format."""
+        fn = tool_schema.get("function", tool_schema)
+        return {
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        }

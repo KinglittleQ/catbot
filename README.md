@@ -1,260 +1,176 @@
-# catbot
+# catbot 🐱
 
-> A minimal Python agent framework with native Feishu (Lark) support.
+A minimal Python agent framework inspired by [openclaw](https://github.com/openclaw/openclaw), with native Feishu (Lark) support.
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+**~1,200 lines** of clean, typed Python implementing the core of an agentic AI system.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        Gateway                          │
-│   (middleware chain: rate-limit, auth, logging, ...)    │
-└──────────────┬──────────────────────────┬───────────────┘
-               │                          │
-    ┌──────────▼──────────┐   ┌───────────▼────────────┐
-    │   FeishuChannel     │   │      CLIChannel         │
-    │ (WebSocket / lark)  │   │   (stdin / stdout)      │
-    └─────────────────────┘   └────────────────────────┘
-               │
-    ┌──────────▼──────────────────────────────────────┐
-    │                    Agent                        │
-    │  system + memory + session history → LLM call   │
-    │  → tool calls → loop until stop                 │
-    └──────┬──────────────────────┬───────────────────┘
-           │                      │
-  ┌────────▼───────┐   ┌──────────▼──────────┐
-  │  LLMProvider   │   │    ToolRegistry      │
-  │  OpenAI /      │   │  read_file           │
-  │  Anthropic     │   │  write_file          │
-  └────────────────┘   │  exec_shell          │
-                        │  web_search          │
-                        │  + custom tools      │
-                        └──────────────────────┘
-           │
-  ┌────────▼───────────────────┐
-  │  SessionManager            │
-  │  (JSONL per chat)          │
-  ├────────────────────────────┤
-  │  Memory                    │
-  │  MEMORY.md (long-term)     │
-  │  HISTORY.md (append log)   │
-  └────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│                  CHANNELS                        │
+│         Feishu (WebSocket)    CLI               │
+└──────────────────┬──────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────┐
+│                  GATEWAY                          │
+│  Routes messages · Manages sessions · Reactions  │
+└──────────────────┬───────────────────────────────┘
+                   │
+      ┌────────────┴────────────┐
+      ▼                         ▼
+┌─────────────┐       ┌──────────────────────────┐
+│   SESSIONS  │       │        WORKSPACE          │
+│             │       │                          │
+│ JSONL files │       │ SOUL.md  — identity      │
+│ Compaction  │       │ MEMORY.md — long-term    │
+│ Daily reset │       │ HISTORY.md — event log   │
+│ Session keys│       │ skills/  — SKILL.md      │
+└─────────────┘       └──────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────┐
+│                   AGENT                           │
+│        Think → Tool Call → Observe → Loop         │
+└──────────────────┬───────────────────────────────┘
+                   │
+      ┌────────────┴────────────┐
+      ▼                         ▼
+┌─────────────┐       ┌──────────────────────────┐
+│  PROVIDERS  │       │         TOOLS             │
+│             │       │                          │
+│  Anthropic  │       │ @tool decorator          │
+│  OpenAI     │       │ Auto JSON schema         │
+│  DeepSeek…  │       │ Sync + async handlers    │
+└─────────────┘       └──────────────────────────┘
 ```
 
 ## Quick Start
 
-```bash
-pip install catbot
-export OPENAI_API_KEY=sk-...
-```
-
 ```python
-import asyncio
-from catbot import Agent, OpenAIProvider
-
-agent = Agent(provider=OpenAIProvider())
-reply = asyncio.run(agent.run("What is the capital of France?"))
-print(reply)  # Paris
-```
-
-## Interactive CLI
-
-```python
-import asyncio
-from catbot import Agent, OpenAIProvider, CLIChannel, Gateway
+import asyncio, os
+from catbot import Gateway, GatewayConfig, AnthropicProvider
 
 async def main():
-    agent = Agent(provider=OpenAIProvider(model="gpt-4o-mini"))
-    gateway = Gateway(agent=agent)
-    gateway.add_channel(CLIChannel())
-    await gateway.start()
+    gw = Gateway(
+        provider=AnthropicProvider(api_key=os.environ["ANTHROPIC_API_KEY"]),
+        config=GatewayConfig(
+            feishu_app_id=os.environ["FEISHU_APP_ID"],
+            feishu_app_secret=os.environ["FEISHU_APP_SECRET"],
+        ),
+    )
+    gw.add_builtin_tools()
+    await gw.start()
 
 asyncio.run(main())
 ```
 
-## Feishu Bot
-
-### 1. Create a Feishu App
-
-1. Go to [Feishu Developer Console](https://open.feishu.cn/)
-2. Create a new app → enable **Bot** capability
-3. Subscribe to event: `im.message.receive_v1`
-4. Enable **WebSocket** long connection (no public server needed!)
-5. Copy **App ID** and **App Secret**
-
-### 2. Configure & Run
+## Install
 
 ```bash
-export FEISHU_APP_ID=cli_xxxxxxxxxxxx
-export FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
-export ANTHROPIC_API_KEY=sk-ant-...
-python examples/feishu_bot.py
+pip install catbot[all]        # all providers + feishu
+pip install catbot[anthropic]  # anthropic only
+pip install catbot[openai]     # openai only
+pip install catbot[feishu]     # feishu channel only
 ```
-
-See [`examples/feishu_bot.py`](examples/feishu_bot.py) for the full example.
 
 ## Custom Tools
 
 ```python
-from catbot import tool, ToolRegistry, Agent, OpenAIProvider
+from catbot import tool, Gateway
 
-@tool
-def get_weather(city: str) -> str:
-    """Get current weather for a city."""
-    return f"Sunny, 22°C in {city}"  # Replace with real API call
+@tool()
+async def get_weather(city: str) -> str:
+    """Get weather for a city. city: City name."""
+    return f"25°C sunny in {city}"
 
-registry = ToolRegistry()
-registry.register(get_weather)
-
-agent = Agent(provider=OpenAIProvider(), tools=registry)
+gw = Gateway(provider=..., config=...)
+gw.add_tool(get_weather)
 ```
 
-## Memory
+The `@tool` decorator **automatically generates JSON schema** from type annotations and docstrings — no boilerplate.
 
-```python
-from catbot import Agent, Memory, OpenAIProvider
+## Session Keys (openclaw-style)
 
-memory = Memory(memory_file="MEMORY.md", history_file="HISTORY.md")
-
-# MEMORY.md is loaded into every system prompt
-# HISTORY.md is an append-only log of all conversations
-
-agent = Agent(provider=OpenAIProvider(), memory=memory)
+Session keys follow the format:
+```
+agent:<agentId>:<channel>:<type>:<chatId>
 ```
 
-## Sessions
-
-```python
-from catbot import SessionManager
-
-sessions = SessionManager(base_dir="./sessions")
-session = await sessions.get("feishu:oc_xxxx", daily_reset=True)
+Examples:
+```
+agent:main:feishu:direct:ou_abc123     # Feishu DM
+agent:main:feishu:group:oc_xyz789      # Feishu group chat
+agent:main:cli:direct:local            # CLI session
+agent:main:cron:cron:daily_report      # Scheduled task
 ```
 
-Sessions are stored as JSONL files (one message per line), keyed by `channel:chat_id`.
+## Workspace Files
 
-## Middleware
+catbot loads workspace files into the system prompt (openclaw-style):
 
-```python
-from catbot import Gateway
+| File | Purpose |
+|------|---------|
+| `SOUL.md` | Agent identity and personality |
+| `AGENTS.md` | Agent instructions |
+| `USER.md` | User preferences and context |
+| `memory/MEMORY.md` | Long-term facts (loaded every turn) |
+| `memory/HISTORY.md` | Event log (append-only, grep-searchable) |
+| `skills/<name>/SKILL.md` | Skill descriptions injected into prompt |
 
-gateway = Gateway(agent=agent)
+Default workspace: `~/.catbot/workspace/`
 
-# Built-in rate limiting
-gateway.use(Gateway.rate_limit(max_calls=10, window_seconds=60))
+## Providers
 
-# Built-in user allowlist
-gateway.use(Gateway.allow_users(["user_id_1", "user_id_2"]))
-
-# Custom middleware
-async def logging_middleware(msg, next_fn):
-    print(f"[{msg.channel}] {msg.user_id}: {msg.text}")
-    result = await next_fn(msg)
-    print(f"[{msg.channel}] bot: {result}")
-    return result
-
-gateway.use(logging_middleware)
-```
-
-## API Reference
-
-### `Agent`
+| Provider | Class | Notes |
+|----------|-------|-------|
+| OpenAI | `OpenAIProvider` | Also works with DeepSeek, Groq, etc. |
+| Anthropic | `AnthropicProvider` | Supports prompt caching |
 
 ```python
-Agent(
-    provider: LLMProvider,
-    tools: ToolRegistry | None = None,
-    memory: Memory | None = None,
-    config: AgentConfig | None = None,
+# OpenAI
+from catbot import OpenAIProvider
+provider = OpenAIProvider(api_key="sk-...", model="gpt-4o")
+
+# DeepSeek (OpenAI-compatible)
+provider = OpenAIProvider(
+    api_key="sk-...",
+    api_base="https://api.deepseek.com/v1",
+    model="deepseek-chat",
 )
 
-await agent.run(
-    user_message: str,
-    session: Session | None = None,
-    extra_context: str = "",
-) -> str
-```
-
-### `AgentConfig`
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `system_prompt` | `"You are a helpful assistant."` | System prompt |
-| `max_turns` | `10` | Max tool-call iterations |
-| `max_tokens` | `4096` | Max tokens per LLM call |
-| `temperature` | `0.7` | Sampling temperature |
-| `model` | `""` | Model override |
-
-### `OpenAIProvider`
-
-```python
-OpenAIProvider(
-    api_key: str | None = None,   # or OPENAI_API_KEY env var
-    base_url: str | None = None,  # custom endpoint (DeepSeek, etc.)
-    model: str = "gpt-4o",
+# Anthropic with prompt caching
+from catbot import AnthropicProvider
+provider = AnthropicProvider(
+    api_key="sk-ant-...",
+    model="claude-opus-4-5",
+    enable_cache=True,
 )
 ```
 
-### `AnthropicProvider`
+## Feishu Setup
 
-```python
-AnthropicProvider(
-    api_key: str | None = None,   # or ANTHROPIC_API_KEY env var
-    model: str = "claude-3-5-sonnet-20241022",
-    enable_caching: bool = True,  # prompt caching
-)
+1. Create an app at [Feishu Open Platform](https://open.feishu.cn/)
+2. Enable **Bot** capability
+3. Subscribe to event: `im.message.receive_v1`
+4. Set permissions: `im:message`, `im:message:send_as_bot`
+5. Configure env vars:
+
+```bash
+export FEISHU_APP_ID=cli_xxx
+export FEISHU_APP_SECRET=xxx
+export ANTHROPIC_API_KEY=sk-ant-xxx
 ```
 
-### `FeishuChannel`
+## Compaction
 
-```python
-FeishuChannel(
-    app_id: str | None = None,    # or FEISHU_APP_ID env var
-    app_secret: str | None = None, # or FEISHU_APP_SECRET env var
-    respond_in_group_only_when_mentioned: bool = True,
-)
-```
+When conversation history exceeds 80% of the context window, catbot automatically:
+1. Summarizes old messages using the LLM
+2. Replaces them with a compact summary
+3. Keeps the most recent messages intact
 
-### `Gateway`
-
-```python
-Gateway(
-    agent: Agent,
-    session_manager: SessionManager | None = None,
-    daily_reset: bool = False,
-)
-
-gateway.add_channel(channel: Channel)
-gateway.use(middleware: MiddlewareFn)
-await gateway.start()
-await gateway.stop()
-```
-
-## Project Structure
-
-```
-catbot/
-├── catbot/
-│   ├── agent.py          # Agent loop (core)
-│   ├── tools.py          # @tool decorator + ToolRegistry + built-ins
-│   ├── session.py        # JSONL session persistence
-│   ├── memory.py         # MEMORY.md + HISTORY.md
-│   ├── gateway.py        # Multi-channel router + middleware
-│   ├── providers/
-│   │   ├── base.py       # LLMProvider ABC
-│   │   ├── openai.py     # OpenAI / compatible
-│   │   └── anthropic.py  # Anthropic Claude
-│   └── channels/
-│       ├── base.py       # Channel ABC
-│       ├── feishu.py     # Feishu WebSocket
-│       └── cli.py        # CLI (local testing)
-├── examples/
-│   ├── hello_world.py
-│   └── feishu_bot.py
-└── pyproject.toml
-```
+This mirrors openclaw's compaction design.
 
 ## License
 
