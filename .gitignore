@@ -1,24 +1,19 @@
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
+*$py.class
+*.so
+.Python
 build/
-.venv/
-venv/
+dist/
+*.egg-info/
+.eggs/
 .env
-*.env
-
-# catbot runtime
-~/.catbot/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# Test
-.pytest_cache/
-.mypy_cache/
+.venv
+env/
+venv/
 .ruff_cache/
-htmlcov/
-.coverage
+.mypy_cache/
+.pytest_cache/
+*.log
+.DS_Store
+~/.catbot/

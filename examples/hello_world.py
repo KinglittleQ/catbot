@@ -1,5 +1,5 @@
 """
-Hello World — the simplest catbot example.
+Hello World example — minimal catbot usage with CLI channel.
 
 Run:
     export OPENAI_API_KEY=sk-...
@@ -9,9 +9,10 @@ Run:
 import asyncio
 import os
 
-from catbot import Agent, AgentConfig, OpenAIProvider, ToolRegistry, SessionManager
-from catbot import make_session_key, Session
-from catbot.tools import get_builtin_tools
+from catbot import Agent, AgentConfig, Gateway, GatewayConfig
+from catbot.channels.cli import CLIChannel
+from catbot.providers.openai import OpenAIProvider
+from catbot.tools import get_builtin_tools, ToolRegistry
 
 
 async def main() -> None:
@@ -33,22 +34,12 @@ async def main() -> None:
         config=AgentConfig(system_prompt="You are a helpful assistant."),
     )
 
-    # 4. Session
-    sessions = SessionManager("~/.catbot/sessions")
-    key = make_session_key("main", "cli", "direct", "demo")
-    session = await sessions.get(key)
+    # 4. Gateway + CLI channel
+    gw = Gateway(agent=agent, config=GatewayConfig())
+    gw.add_channel(CLIChannel())
 
-    # 5. Chat loop
-    print("catbot hello world — Ctrl+C to exit\n")
-    while True:
-        try:
-            user = input("You> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not user:
-            continue
-        reply = await agent.run(user, session)
-        print(f"Bot> {reply}\n")
+    # 5. Run!
+    await gw.run()
 
 
 if __name__ == "__main__":

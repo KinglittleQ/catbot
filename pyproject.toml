@@ -1,18 +1,20 @@
 [project]
 name = "catbot"
 version = "0.1.0"
-description = "A minimal Python agent framework with Feishu support"
+description = "A minimal Python agent framework with Feishu support, inspired by openclaw"
 readme = "README.md"
-license = { text = "MIT" }
 requires-python = ">=3.11"
-keywords = ["agent", "llm", "feishu", "lark", "chatbot", "ai"]
+license = { text = "MIT" }
+keywords = ["agent", "llm", "feishu", "lark", "chatbot", "openclaw"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
 dependencies = [
     "loguru>=0.7.0",
     "aiofiles>=24.0.0",
@@ -26,20 +28,19 @@ all = [
     "openai>=1.50.0",
     "anthropic>=0.40.0",
     "lark-oapi>=1.3.0",
+    "httpx>=0.27.0",
 ]
 dev = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=0.24.0",
-    "ruff>=0.8.0",
-    "mypy>=1.10.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
 ]
 
-[project.scripts]
-catbot = "catbot.cli:main"
-
 [project.urls]
-Homepage = "https://github.com/dcqbot/catbot"
-Repository = "https://github.com/dcqbot/catbot"
+Homepage = "https://github.com/KinglittleQ/catbot"
+Repository = "https://github.com/KinglittleQ/catbot"
+Issues = "https://github.com/KinglittleQ/catbot"
 
 [build-system]
 requires = ["hatchling"]
@@ -59,4 +60,3 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
